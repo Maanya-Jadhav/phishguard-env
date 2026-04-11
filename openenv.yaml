@@ -1,18 +1,70 @@
-# BUG FIX: version bumped from 1.0.0 to match codebase (1.0.3)
-name: "PhishGuard-Env"
-version: "1.0.3"
-description: "Phishing triage simulation for SOC Analysts."
-task_ids:
-  - "lv1"
-  - "lv2"
-  - "lv3"
-  - "lv4"
-  - "lv5"
-  - "lv6"
-  - "lv7"
-  - "lv8"
-  - "lv9"
-  - "lv10"
+# PhishGuard-Env – OpenEnv Manifest
+# Each task must declare a grader so the validator can verify scoring.
+id: phishguard-env
+name: "PhishGuard-Env — SOC Analyst Phishing Triage"
+description: >
+  A real-world RL environment where an AI agent acts as a SOC analyst
+  triaging phishing, malware, BEC, spam, and safe emails.
+  The agent must classify each email using a four-action triage system.
+  Rewards are graded continuously in (0.0, 1.0).
+
+entry_point: env:app
+
+tasks:
+  - id: easy
+    name: easy_triage
+    grader: "grader:grade_easy"
+    description: >
+      Basic triage — high confidence signals, clear indicators.
+      Covers SPAM detection, basic PHISH blocking, and SAFE email verification.
+      Scoring: 60% correct action + 40% threat identification accuracy.
+
+  - id: medium
+    name: medium_triage
+    grader: "grader:grade_medium"
+    description: >
+      Intermediate triage — mixed signals, some ambiguity.
+      Covers MALWARE quarantine, HR safe emails, BEC wire fraud, shared-doc phishing.
+      Scoring: 40% correct action + 35% on-time detection + 25% escalation quality.
+
+  - id: hard
+    name: hard_triage
+    grader: "grader:grade_hard"
+    description: >
+      Advanced triage — low confidence signals, sophisticated attacks.
+      Covers macro malware, QR-code phishing, BEC domain compromise.
+      Scoring: 35% correct action + 30% threat accuracy + 20% escalation + 15% priority.
+
+observation_space:
+  type: object
+  fields:
+    sender: string
+    subject: string
+    body: string
+    links: list
+    has_attachments: boolean
+    spf_record: "string — pass | softfail | fail"
+    dmarc_record: "string — pass | fail | none"
+    urgency_level: "string — low | medium | high | critical"
+    confidence_hint: string
+
+action_space:
+  type: string
+  allowed_actions:
+    - MARK_SAFE
+    - MOVE_TO_SPAM
+    - QUARANTINE
+    - BLOCK_DOMAIN
+
+reward:
+  type: continuous
+  range: [0.02, 0.95]
+  description: >
+    All rewards strictly inside open interval (0, 1).
+    R_PERFECT=0.95, R_BREACH=0.02. Health drains on reward < 0.15.
+
 tags:
-  - "cybersecurity"
-  - "openenv"
+  - cybersecurity
+  - openenv
+  - phishing
+  - soc

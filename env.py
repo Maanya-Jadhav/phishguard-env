@@ -608,19 +608,51 @@ async def step(action: PhishAction) -> StepResponse:
 
 
 # ── State ─────────────────────────────────────────────────────────────────────
-@app.get("/state", tags=["Environment"])
-async def state() -> dict:
-    """Read-only snapshot of current environment state. Does not advance sim."""
-    async with _env_lock:
-        return {
-            "active_level":     _env.active_level,
-            "current_task_idx": _env.current_task_idx,
-            "health":           _env.health,
-            "score":            round(_env.score, 4),
-            "task_scores":      list(_env.task_scores),
-            "scenarios_total":  len(_env.scenarios),
-            "overall_score":    calculate_overall_score(_env.task_scores),
-        }
+# ── Tasks ─────────────────────────────────────────────────────────────────────
+@app.get("/tasks", tags=["Environment"])
+async def tasks() -> dict:
+    """List all tasks with their IDs, difficulty, and correct actions."""
+    return {
+        "tasks": [
+            {
+                "task_id":    s["id"],
+                "difficulty": s["level"],
+                "type":       s["type"],
+                "correct":    s["correct"],
+            }
+            for s in SCENARIOS
+        ]
+    }
+
+
+# ── Grader ────────────────────────────────────────────────────────────────────
+@app.post("/grader", tags=["Environment"])
+async def grader(request: dict) -> dict:
+    """
+    Grade a triage action for a specific task without running a full episode.
+    The OpenEnv validator calls this endpoint to verify graders are working.
+
+    Body: { "task_id": "lv1", "action": "MOVE_TO_SPAM" }
+    """
+    task_id = request.get("task_id", "lv1")
+    action  = request.get("action",  "QUARANTINE")
+
+    scenario = next((s for s in SCENARIOS if s["id"] == task_id), None)
+    if scenario is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Task '{task_id}' not found. Valid IDs: {[s['id'] for s in SCENARIOS]}",
+        )
+
+    reward, message = grade_action(action, scenario["correct"], scenario["type"])
+
+    return {
+        "task_id":    task_id,
+        "action":     action,
+        "reward":     reward,
+        "is_correct": reward >= R_PERFECT,
+        "message":    message,
+    }
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
