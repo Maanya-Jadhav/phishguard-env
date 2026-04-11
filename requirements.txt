@@ -1,0 +1,18 @@
+# PhishGuard-Env dependencies
+# Pinned to minor versions for reproducibility.
+# Update pins deliberately — do not let pip float to latest.
+
+# ── Environment server ────────────────────────────────────────────────────────
+fastapi>=0.111,<1.0
+uvicorn[standard]>=0.29,<1.0
+pydantic>=2.0,<3.0
+
+# ── OpenEnv framework ─────────────────────────────────────────────────────────
+openenv
+
+# ── Inference agent ───────────────────────────────────────────────────────────
+openai>=1.30,<2.0
+requests>=2.31,<3.0       # BUG FIX: was missing; inference.py imports requests
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+python-dotenv>=1.0,<2.0

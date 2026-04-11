@@ -1,0 +1,34 @@
+# Git metadata — no need inside the image
+.git/
+.gitignore
+.gitattributes
+
+# Python cache — rebuilt inside the image
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Package manager lock files — not needed at runtime
+uv.lock
+poetry.lock
+
+# IDE / OS noise
+.vscode/
+.idea/
+.DS_Store
+
+# Test files — not needed in production image
+test_*.py
+tests/
+
+# Inference agent — client-side only, not needed in server image
+inference.py
+
+# Environment variable files — may contain secrets
+.env*
+
+# Inference run outputs
+results_*.json
+
+# Docs
+README.md
