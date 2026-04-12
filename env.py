@@ -19,15 +19,17 @@ Endpoints
   POST /grade/{difficulty}  → grade a full metrics dict for a difficulty
   POST /grade/performance   → aggregate cross-level grader
 
-LEVEL DESIGN
-------------
-  easy   → lv1, lv2, lv3         (3 tasks)
-  medium → lv4, lv5, lv6, lv7   (4 tasks)
-  hard   → lv8, lv9, lv10       (3 tasks)
+DIFFICULTY → TASK MAPPING
+--------------------------
+  easy   → lv1 (SPAM), lv2 (PHISH), lv3 (SAFE)              — 3 scenarios
+  medium → lv4 (MALWARE), lv5 (SAFE), lv6 (BEC), lv7 (PHISH) — 4 scenarios
+  hard   → lv8 (MALWARE), lv9 (PHISH), lv10 (BEC)            — 3 scenarios
+
+Scenario order is fixed via seed=42 for reproducibility across runs.
 
 Metrics tracked per episode (keys required by GRADERS)
 -------------------------------------------------------
-  total_tasks      : number of scenarios in this level
+  total_tasks      : number of scenarios in this difficulty
   completed_tasks  : steps where a graded action was taken
   perfect_tasks    : steps where reward >= R_PERFECT
   on_time          : steps where reward >= HEALTH_DRAIN_THRESHOLD
@@ -35,9 +37,15 @@ Metrics tracked per episode (keys required by GRADERS)
   disruption_count : steps where reward == R_DISRUPTION
   total_steps      : total /step calls
 
+Target score ranges (calibrated grader weights)
+-----------------------------------------------
+  easy   → ~0.86   (max raw 0.87)
+  medium → ~0.75   (max raw 0.76)
+  hard   → ~0.56   (max raw 0.56)
+
 Episode score
 -------------
-When done=True, info["score"] = GRADERS[active_level](metrics).
+When done=True, info["score"] = GRADERS[active_difficulty](metrics).
 This is the same function the OpenEnv validator checks — guaranteeing
 consistency between what the validator sees and what we report.
 """
@@ -73,8 +81,6 @@ except ImportError:
         OpenEnv = object
 
 # ── Grader imports ────────────────────────────────────────────────────────────
-# NOTE: SCENARIO_LOADERS has been removed — it never existed in grader.py.
-#       Level-to-scenario mapping is owned entirely by LEVEL_MAP in this file.
 from grader import (
     R_BREACH,
     R_DISRUPTION,
@@ -87,7 +93,7 @@ from grader import (
     grade_performance,
 )
 
-VERSION = "1.0.3"
+VERSION = "1.1.0"
 
 # ═════════════════════════════════════════════════════════════════════════════
 # SCENARIO DEFINITIONS  (lv1 → lv10)
@@ -251,13 +257,16 @@ SCENARIOS: List[dict] = [
     },
 ]
 
-LEVEL_MAP: dict[str, list[str]] = {
+DIFFICULTY_MAP: dict[str, list[str]] = {
     "easy":   ["lv1", "lv2", "lv3"],
     "medium": ["lv4", "lv5", "lv6", "lv7"],
     "hard":   ["lv8", "lv9", "lv10"],
 }
 
 _SCENARIO_BY_ID: dict[str, dict] = {s["id"]: s for s in SCENARIOS}
+
+# Fixed RNG seed — same scenario order every episode for reproducibility
+_SHUFFLE_SEED = 42
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -291,36 +300,39 @@ class PhishGuardEnv(OpenEnv):
         self.score: float = 0.0
         self.task_scores: List[float] = []
         self.metrics: dict = _empty_metrics()
-        self.active_level: str = "easy"
-        self._load_level("easy")
+        self.active_difficulty: str = "easy"
+        self._load_difficulty("easy")
 
-    def _load_level(self, level: str) -> None:
-        level = level.lower()
-        if level not in LEVEL_MAP:
-            raise ValueError(f"Unknown level '{level}'. Valid choices: easy | medium | hard")
-        ids    = LEVEL_MAP[level]
+    def _load_difficulty(self, difficulty: str) -> None:
+        difficulty = difficulty.lower()
+        if difficulty not in DIFFICULTY_MAP:
+            raise ValueError(
+                f"Unknown difficulty '{difficulty}'. Valid choices: easy | medium | hard"
+            )
+        ids    = DIFFICULTY_MAP[difficulty]
         subset = [dict(_SCENARIO_BY_ID[sid]) for sid in ids]
-        random.shuffle(subset)
+        # Fixed seed — same scenario order every run (reproducibility)
+        random.Random(_SHUFFLE_SEED).shuffle(subset)
 
-        self.active_level     = level
-        self.scenarios        = subset
-        self.current_task_idx = 0
-        self.health           = self.MAX_HEALTH
-        self.score            = 0.0
-        self.task_scores      = []
-        self.metrics          = _empty_metrics(total_tasks=len(subset))
+        self.active_difficulty    = difficulty
+        self.scenarios            = subset
+        self.current_task_idx     = 0
+        self.health               = self.MAX_HEALTH
+        self.score                = 0.0
+        self.task_scores          = []
+        self.metrics              = _empty_metrics(total_tasks=len(subset))
 
     def _is_over(self) -> bool:
         return self.health <= 0 or self.current_task_idx >= len(self.scenarios)
 
-    def reset(self, level: str = "easy") -> dict:
-        self._load_level(level)
+    def reset(self, difficulty: str = "easy") -> dict:
+        self._load_difficulty(difficulty)
         if not self.scenarios:
-            raise ValueError(f"No scenarios found for level '{level}'")
+            raise ValueError(f"No scenarios found for difficulty '{difficulty}'")
         first_task = self.scenarios[self.current_task_idx]
         log.info(
-            "Episode reset | level=%s | first=%s | total=%d",
-            self.active_level, first_task["id"], len(self.scenarios),
+            "Episode reset | difficulty=%s | first=%s | total=%d",
+            self.active_difficulty, first_task["id"], len(self.scenarios),
         )
         return first_task["data"]
 
@@ -330,7 +342,7 @@ class PhishGuardEnv(OpenEnv):
 
         Returns (obs, reward, done, info).
         info["score"] is set (non-None) only when done=True, using
-        GRADERS[active_level](metrics) — the grader the validator checks.
+        GRADERS[active_difficulty](metrics) — the grader the validator checks.
         """
         # ── Guard ─────────────────────────────────────────────────────────────
         if self._is_over():
@@ -376,8 +388,8 @@ class PhishGuardEnv(OpenEnv):
             self.metrics["disruption_count"] += 1
 
         log.info(
-            "Step | level=%s | task=%s | action=%s | reward=%.4f | %s",
-            self.active_level, task_id,
+            "Step | difficulty=%s | task=%s | action=%s | reward=%.4f | %s",
+            self.active_difficulty, task_id,
             action_str.strip().upper(), reward, verdict_msg,
         )
 
@@ -385,11 +397,11 @@ class PhishGuardEnv(OpenEnv):
         if reward < HEALTH_DRAIN_THRESHOLD:
             self.health -= 1
             feedback = (
-                f"⚠️  CRITICAL ERROR: {verdict_msg} "
+                f"CRITICAL ERROR: {verdict_msg} "
                 f"| Health remaining: {self.health}/{self.MAX_HEALTH}"
             )
         else:
-            feedback = f"✅ Analysis accepted: {verdict_msg}"
+            feedback = f"Analysis accepted: {verdict_msg}"
 
         # ── Advance pointer ───────────────────────────────────────────────────
         done = False
@@ -397,14 +409,14 @@ class PhishGuardEnv(OpenEnv):
 
         if self.health <= 0:
             done     = True
-            feedback = "❌ TERMINATED: Too many critical failures — health depleted."
+            feedback = "TERMINATED: Too many critical failures — health depleted."
 
         if self.current_task_idx >= len(self.scenarios):
             done = True
             if self.health > 0:
                 feedback = (
-                    f"🏆 SUCCESS: All {len(self.scenarios)} "
-                    f"{self.active_level.upper()} scenarios completed."
+                    f"SUCCESS: All {len(self.scenarios)} "
+                    f"{self.active_difficulty.upper()} scenarios completed."
                 )
 
         obs = (
@@ -416,10 +428,10 @@ class PhishGuardEnv(OpenEnv):
         # ── Episode score via GRADERS ─────────────────────────────────────────
         episode_score: Optional[float] = None
         if done:
-            episode_score = GRADERS[self.active_level](self.metrics)
+            episode_score = GRADERS[self.active_difficulty](self.metrics)
             log.info(
-                "Episode done | level=%s | score=%.6f | metrics=%s",
-                self.active_level, episode_score, self.metrics,
+                "Episode done | difficulty=%s | score=%.6f | metrics=%s",
+                self.active_difficulty, episode_score, self.metrics,
             )
 
         return obs, reward, done, {
@@ -474,24 +486,24 @@ async def health_probe() -> dict:
 
 @app.post("/reset", tags=["Environment"])
 async def reset(request: Optional[ResetRequest] = None) -> ResetResponse:
-    """Reset for a new episode. Body (optional): { "level": "easy"|"medium"|"hard" }"""
-    level = (request.level if request else "easy").lower()
-    if level not in LEVEL_MAP:
+    """Reset for a new episode. Body (optional): { \"difficulty\": \"easy\"|\"medium\"|\"hard\" }"""
+    difficulty = (request.difficulty if request else "easy").lower()
+    if difficulty not in DIFFICULTY_MAP:
         raise HTTPException(
             status_code=422,
-            detail=f"Invalid level '{level}'. Must be one of: easy | medium | hard",
+            detail=f"Invalid difficulty '{difficulty}'. Must be one of: easy | medium | hard",
         )
     async with _env_lock:
-        obs = _env.reset(level=level)
-        first_scenario = _env.scenarios[_env.current_task_idx]
-        active_level   = _env.active_level
+        obs               = _env.reset(difficulty=difficulty)
+        first_scenario    = _env.scenarios[_env.current_task_idx]
+        active_difficulty = _env.active_difficulty
 
     return ResetResponse(
         observation=obs,
         task_id=first_scenario["id"],
         task_group=first_scenario["level"],
-        level=active_level,
-        total_tasks=len(LEVEL_MAP[level]),
+        difficulty=active_difficulty,
+        total_tasks=len(DIFFICULTY_MAP[difficulty]),
     )
 
 
@@ -516,10 +528,10 @@ async def step(action: PhishAction) -> StepResponse:
 async def state() -> dict:
     """Read-only snapshot. Does not advance the simulation."""
     async with _env_lock:
-        episode_score  = GRADERS[_env.active_level](_env.metrics)
+        episode_score  = GRADERS[_env.active_difficulty](_env.metrics)
         rolling_score  = calculate_overall_score(_env.task_scores)
         return {
-            "level":         _env.active_level,
+            "difficulty":    _env.active_difficulty,
             "health":        _env.health,
             "score":         round(_env.score, 4),
             "overall_score": episode_score,   # GRADERS-based — what validator checks
@@ -548,8 +560,8 @@ async def grader_endpoint(request: dict) -> dict:
     Grade a single action for a task without a full episode.
     Body: { "task_id": "lv1", "action": "MOVE_TO_SPAM" }
     """
-    task_id = request.get("task_id", "lv1")
-    action  = request.get("action",  "QUARANTINE")
+    task_id  = request.get("task_id", "lv1")
+    action   = request.get("action",  "QUARANTINE")
     scenario = next((s for s in SCENARIOS if s["id"] == task_id), None)
     if scenario is None:
         raise HTTPException(
@@ -567,7 +579,7 @@ async def grader_endpoint(request: dict) -> dict:
 
 
 @app.post("/grade/{difficulty}", tags=["Grading"])
-async def grade_difficulty(difficulty: str, metrics: dict) -> dict:
+async def grade_difficulty_endpoint(difficulty: str, metrics: dict) -> dict:
     """
     Grade a full episode metrics dict for a difficulty level.
     Mirrors FocusAI's GRADERS[difficulty](metrics) pattern.
