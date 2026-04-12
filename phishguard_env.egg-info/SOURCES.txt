@@ -1,0 +1,8 @@
+README.md
+pyproject.toml
+phishguard_env.egg-info/PKG-INFO
+phishguard_env.egg-info/SOURCES.txt
+phishguard_env.egg-info/dependency_links.txt
+phishguard_env.egg-info/requires.txt
+phishguard_env.egg-info/top_level.txt
+server/app.py
