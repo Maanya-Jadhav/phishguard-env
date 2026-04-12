@@ -1,6 +1,6 @@
 # PhishGuard-Env – OpenEnv Manifest
 # Each task must declare a grader so the validator can verify scoring.
-# Pattern mirrors Focus-AI's openenv.yaml with per-difficulty graders + aggregate.
+# Pattern mirrors FocusAI's openenv.yaml with per-difficulty graders + aggregate.
 id: phishguard-env
 name: "PhishGuard-Env — SOC Analyst Phishing Triage"
 description: >
@@ -8,6 +8,7 @@ description: >
   triaging phishing, malware, BEC, spam, and safe emails.
   The agent must classify each email using a four-action triage system.
   Rewards are graded continuously in (0.0, 1.0).
+  Scenario order is fixed via seed=42 for reproducibility.
 
 entry_point: env:app
 
@@ -16,9 +17,9 @@ tasks:
     name: easy_triage
     grader: "grader:grade_easy"
     description: >
-      Basic triage — high confidence signals, clear indicators.
+      Basic triage — high confidence signals, clear threat indicators.
       Covers SPAM detection, basic PHISH blocking, and SAFE email verification.
-      Scoring: 60% correct action + 40% threat identification accuracy.
+      Scoring: 52% perfect triage + 35% completion. Target score: 0.80–0.99.
 
   - id: medium
     name: medium_triage
@@ -26,7 +27,7 @@ tasks:
     description: >
       Intermediate triage — mixed signals, some ambiguity.
       Covers MALWARE quarantine, HR safe emails, BEC wire fraud, shared-doc phishing.
-      Scoring: 40% correct action + 35% on-time detection + 25% escalation quality.
+      Scoring: 35% perfect + 27% on-time + 14% completion. Target score: 0.70–0.80.
 
   - id: hard
     name: hard_triage
@@ -34,7 +35,8 @@ tasks:
     description: >
       Advanced triage — low confidence signals, sophisticated attacks.
       Covers macro malware, QR-code phishing, BEC domain compromise.
-      Scoring: 35% correct action + 30% threat accuracy + 20% escalation + 15% priority.
+      Scoring: 25% perfect + 18% on-time + 10% completion + 3% zero-breach bonus.
+      Target score: 0.50–0.60.
 
   - id: performance
     name: aggregate_performance
@@ -42,7 +44,7 @@ tasks:
     description: >
       Cross-difficulty aggregate grader for leaderboard ranking.
       Provides a single unified score across all difficulty levels.
-      Scoring: 40% correct actions + 30% on-time + 20% escalation + 10% priority.
+      Scoring: 38% perfect + 23% on-time + 9% completion + 3% zero-breach bonus.
 
 observation_space:
   type: object
@@ -75,10 +77,12 @@ reward:
 scoring:
   description: >
     Each task's final score is STRICTLY inside the open interval (0, 1).
-    The _safe_score() function guarantees: 0.02 ≤ score ≤ 0.95.
-    Minimum achievable: 0.02 (breach / nothing done).
-    Maximum achievable: 0.95 (perfect episode).
-  formula: "_safe_score(raw) = 0.02 + 0.93 * clamp(raw, 0.0, 1.0)"
+    Grader weights are calibrated for difficulty-progressive scoring:
+      easy   → target 0.80–0.99  (max raw 0.87)
+      medium → target 0.70–0.80  (max raw 0.76)
+      hard   → target 0.50–0.60  (max raw 0.56)
+    safe_score(raw) = 0.01 + 0.98 * clamp(raw, 0.0, 1.0)
+  formula: "safe_score(raw) = 0.01 + 0.98 * clamp(raw, 0.0, 1.0)"
 
 tags:
   - cybersecurity
