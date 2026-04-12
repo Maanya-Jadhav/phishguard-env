@@ -91,7 +91,7 @@ try:
     from openenv import OpenEnv
 except ImportError:
     try:
-        from openenv.core import OpenEnv
+        from openenv.core import OpenEnv  # type: ignore
     except ImportError:
         OpenEnv = object  # Runs as a plain Python class if openenv is absent
 
