@@ -1,6 +1,16 @@
 """
 inference.py – PhishGuard-Env Baseline Inference Script
 ========================================================
+
+Structured stdout logs (required by OpenEnv validator):
+  [START] task=<level>
+  [STEP]  task=<level> step=N reward=R is_correct=true|false
+  [END]   task=<level> score=S steps=N
+
+The episode score in [END] comes directly from info["score"] returned by
+/step when done=True — which is GRADERS[level](metrics) from grader.py.
+This guarantees the validator sees the same grader-based score that env.py
+computes internally.
 """
 
 from __future__ import annotations
@@ -66,8 +76,6 @@ SYSTEM_PROMPT = textwrap.dedent("""
     - This is a contextual signal from your SIEM, mail gateway, or threat-intel feed.
     - It is intentionally noisy — treat it as one data-point, not ground truth.
     - If it directly contradicts other signals (SPF, DMARC, links), weigh all evidence.
-    - Example hints: "AV: attachment flagged", "Gateway: domain registered 3 days ago",
-      "Threat Intel: domain added to IOC feed", "SIEM: sender in address book 2+ years".
 """).strip()
 
 
@@ -147,9 +155,22 @@ def _choose_action(observation: Dict[str, Any]) -> tuple[str, str]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_level(level: str) -> Dict[str, Any]:
-    print(f"\n{'═'*60}", flush=True)
+    """
+    Run a complete episode for the given difficulty level.
+
+    The episode score is taken from info["score"] on the terminal step
+    (done=True) — this is GRADERS[level](metrics) computed by env.py,
+    the same value the OpenEnv validator uses.
+
+    Falls back to /state's overall_score only if no terminal step score
+    was captured (e.g. MAX_STEPS_PER_LEVEL reached without done=True).
+    """
+    print(f"\n{'='*60}", flush=True)
     print(f"  LEVEL: {level.upper()}", flush=True)
-    print(f"{'═'*60}", flush=True)
+    print(f"{'='*60}", flush=True)
+
+    # ── Emit [START] ─────────────────────────────────────────────────────────
+    print(f"[START] task={level}", flush=True)
 
     reset_resp  = _post("/reset", {"level": level})
     obs         = reset_resp["observation"]
@@ -157,19 +178,23 @@ def run_level(level: str) -> Dict[str, Any]:
     print(f"  Tasks in this level: {total_tasks}", flush=True)
 
     steps: List[dict] = []
-    step_num = 0
-    done     = False
+    step_num            = 0
+    done                = False
     step_resp: Dict[str, Any] = {}
+    # episode_score is populated from info["score"] when done=True.
+    # It comes from GRADERS[level](metrics) inside env.py.
+    episode_score: Optional[float] = None
+    # episode_metrics is populated from info["metrics"] when done=True.
+    episode_metrics: Optional[dict] = None
 
     while not done and step_num < MAX_STEPS_PER_LEVEL:
         step_num += 1
-
         task_id = reset_resp["task_id"] if step_num == 1 else step_resp.get("task_id", "?")
         print(f"\n  Step {step_num} | task={task_id}", flush=True)
 
         action, reasoning = _choose_action(obs)
-        print(f"    → Action   : {action}", flush=True)
-        print(f"    → Reasoning: {reasoning[:80]}", flush=True)
+        print(f"    -> Action   : {action}", flush=True)
+        print(f"    -> Reasoning: {reasoning[:80]}", flush=True)
 
         step_resp  = _post("/step", {"action": action, "reasoning": reasoning})
         reward     = step_resp["reward"]
@@ -177,8 +202,11 @@ def run_level(level: str) -> Dict[str, Any]:
         is_correct = step_resp["is_correct"]
         info       = step_resp.get("info", {})
 
-        print(f"    ← Reward   : {reward:.4f}  |  correct={is_correct}  |  done={done}", flush=True)
-        print(f"    ← Feedback : {info.get('feedback', '')[:100]}", flush=True)
+        print(f"    <- Reward   : {reward:.4f}  |  correct={is_correct}  |  done={done}", flush=True)
+        print(f"    <- Feedback : {info.get('feedback', '')[:100]}", flush=True)
+
+        # ── Emit [STEP] ───────────────────────────────────────────────────────
+        print(f"[STEP] task={level} step={step_num} reward={reward:.4f} is_correct={is_correct}", flush=True)
 
         steps.append({
             "step":       step_num,
@@ -189,22 +217,36 @@ def run_level(level: str) -> Dict[str, Any]:
             "reasoning":  reasoning,
         })
 
+        # Capture episode score and metrics from the terminal step.
+        # info["score"] is non-None only when done=True (set by env.py via GRADERS).
+        if done:
+            episode_score   = info.get("score")
+            episode_metrics = info.get("metrics")
+
         obs = step_resp.get("observation")
         if obs is None and not done:
             print("  [WARN] obs is None but done=False — breaking.", flush=True)
             break
 
-    state   = _get("/state")
-    overall = state.get("overall_score", 0.0)
+    # ── Fallback: fetch from /state if episode ended without done=True ────────
+    # (happens when MAX_STEPS_PER_LEVEL is reached before all tasks complete)
+    if episode_score is None:
+        state_resp    = _get("/state")
+        episode_score = state_resp.get("overall_score", 0.01)
+        episode_metrics = state_resp.get("metrics")
 
-    print(f"\n  {'─'*50}", flush=True)
-    print(f"  Level {level.upper()} complete | steps={step_num} | overall_score={overall:.4f}", flush=True)
+    print(f"\n  {'-'*50}", flush=True)
+    print(f"  Level {level.upper()} complete | steps={step_num} | score={episode_score:.4f}", flush=True)
+
+    # ── Emit [END] ────────────────────────────────────────────────────────────
+    print(f"[END] task={level} score={episode_score:.4f} steps={step_num}", flush=True)
 
     return {
-        "level":         level,
-        "total_tasks":   total_tasks,
-        "steps":         steps,
-        "overall_score": overall,
+        "level":           level,
+        "total_tasks":     total_tasks,
+        "steps":           steps,
+        "overall_score":   episode_score,
+        "episode_metrics": episode_metrics or {},
     }
 
 
@@ -223,22 +265,16 @@ def main() -> None:
     parser.add_argument(
         "--output",
         default=None,
-        help="Path to write JSON results (default: results_<timestamp>.json).",
+        help="Path to write JSON results.",
     )
     args = parser.parse_args()
 
     levels_to_run = [args.level] if args.level else ["easy", "medium", "hard"]
     output_path   = args.output or f"results_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}.json"
 
-    print(f"[START] PhishGuard-Env Baseline Inference", flush=True)
-    print(f"        model  = {MODEL_NAME}", flush=True)
-    print(f"        env    = {ENV_BASE_URL}", flush=True)
-    print(f"        levels = {levels_to_run}", flush=True)
-    print(f"        output = {output_path}", flush=True)
-
     try:
         health = _get("/health")
-        print(f"        server status: {health.get('status', 'unknown')}", flush=True)
+        print(f"  server status: {health.get('status', 'unknown')}", flush=True)
     except Exception as exc:
         print(f"[ERROR] Cannot reach environment server at {ENV_BASE_URL}: {exc}", flush=True)
         print("        Make sure `python env.py` is running in another terminal.", flush=True)
@@ -250,65 +286,75 @@ def main() -> None:
         results.append(result)
         time.sleep(1)
 
-    total_steps   = sum(len(r["steps"])                       for r in results)
+    # ── Aggregate scoring ─────────────────────────────────────────────────────
+    # Weighted by task count so all 10 tasks contribute equally
+    # (easy=3, medium=4, hard=3).
+    total_steps   = sum(len(r["steps"]) for r in results)
     total_correct = sum(s["is_correct"] for r in results for s in r["steps"])
     weighted_sum  = sum(r["overall_score"] * r["total_tasks"] for r in results)
-    total_tasks   = sum(r["total_tasks"]                      for r in results)
+    total_tasks   = sum(r["total_tasks"] for r in results)
     avg_score     = weighted_sum / total_tasks if total_tasks else 0.0
 
-    print(f"\n{'═'*60}", flush=True)
+    # Cross-level grade_performance over combined metrics (mirrors FocusAI)
+    if len(results) > 1:
+        combined_metrics: Dict[str, Any] = {
+            "total_tasks":      sum(r["episode_metrics"].get("total_tasks",      0) for r in results),
+            "completed_tasks":  sum(r["episode_metrics"].get("completed_tasks",  0) for r in results),
+            "perfect_tasks":    sum(r["episode_metrics"].get("perfect_tasks",    0) for r in results),
+            "on_time":          sum(r["episode_metrics"].get("on_time",          0) for r in results),
+            "breach_count":     sum(r["episode_metrics"].get("breach_count",     0) for r in results),
+            "disruption_count": sum(r["episode_metrics"].get("disruption_count", 0) for r in results),
+            "total_steps":      sum(r["episode_metrics"].get("total_steps",      0) for r in results),
+        }
+        performance_score = float(grade_performance(combined_metrics))
+    else:
+        performance_score = avg_score
+
+    print(f"\n{'='*60}", flush=True)
     print(f"  BASELINE SUMMARY", flush=True)
-    print(f"{'═'*60}", flush=True)
-    print(f"  Total steps   : {total_steps}", flush=True)
-    print(f"  Correct steps : {total_correct}", flush=True)
-    print(f"  Weighted score: {avg_score:.4f}  (pass threshold: {PASS_THRESHOLD})", flush=True)
+    print(f"{'='*60}", flush=True)
+    print(f"  Total steps      : {total_steps}", flush=True)
+    print(f"  Correct steps    : {total_correct}", flush=True)
+    print(f"  Weighted score   : {avg_score:.4f}  (pass threshold: {PASS_THRESHOLD})", flush=True)
+    print(f"  Performance score: {performance_score:.4f}  (grade_performance)", flush=True)
     for r in results:
         print(f"  {r['level']:8s} score: {r['overall_score']:.4f}  ({r['total_tasks']} tasks)", flush=True)
 
     success = avg_score >= PASS_THRESHOLD
 
-    # ── FIX: flatten all steps into a top-level tasks array ──────────────────
-    # The OpenEnv validator counts tasks by reading this flat list.
-    # Nesting steps inside level_results caused "Not enough tasks with graders".
+    # Build per-task summary for the results file
     all_tasks: List[Dict[str, Any]] = []
     for r in results:
-        for s in r["steps"]:
-            all_tasks.append({
-                "task_id":    s["task_id"],
-                "is_correct": s["is_correct"],
-                "reward":     s["reward"],
-                "action":     s["action"],
-                "reasoning":  s["reasoning"],
-                "level":      r["level"],
-            })
+        level_correct = sum(1 for s in r["steps"] if s["is_correct"])
+        all_tasks.append({
+            "task_id":    r["level"],
+            "is_correct": level_correct > 0,
+            "reward":     r["overall_score"],
+            "level":      r["level"],
+            "steps":      r["steps"],
+        })
 
     run_summary = {
-        "timestamp":      datetime.now(timezone.utc).isoformat(),
-        "model":          MODEL_NAME,
-        "env":            ENV_BASE_URL,
-        "levels":         levels_to_run,
-        "total_steps":    total_steps,
-        "total_correct":  total_correct,
-        "avg_score":      round(avg_score, 4),
-        "pass_threshold": PASS_THRESHOLD,
-        "success":        success,
-        "tasks":          all_tasks,          # ← FIX: flat list for validator
-        "level_results":  results,            # ← kept for human readability
+        "timestamp":         datetime.now(timezone.utc).isoformat(),
+        "model":             MODEL_NAME,
+        "env":               ENV_BASE_URL,
+        "levels":            levels_to_run,
+        "total_steps":       total_steps,
+        "total_correct":     total_correct,
+        "avg_score":         round(avg_score, 4),
+        "performance_score": round(performance_score, 4),
+        "pass_threshold":    PASS_THRESHOLD,
+        "success":           success,
+        "tasks":             all_tasks,
+        "level_results":     results,
     }
 
     try:
         with open(output_path, "w", encoding="utf-8") as fh:
             json.dump(run_summary, fh, indent=2)
-        print(f"\n  Results saved → {output_path}", flush=True)
+        print(f"\n  Results saved -> {output_path}", flush=True)
     except OSError as exc:
         print(f"\n  [WARN] Could not save results: {exc}", flush=True)
-
-    print(
-        f"\n[END] success={str(success).lower()} "
-        f"steps={total_steps} "
-        f"score={avg_score:.3f}",
-        flush=True,
-    )
 
 
 if __name__ == "__main__":
