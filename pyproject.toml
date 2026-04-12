@@ -3,28 +3,29 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-# BUG FIX: version bumped to match the zip name and actual codebase (was 1.0.0)
 name = "phishguard-env"
-version = "1.0.3"
+version = "1.1.0"
 description = "A SOC Analyst simulation environment for phishing email triage."
 readme = "README.md"
 requires-python = ">=3.10"
-authors = [
-    { name = "Arin Kulkarni" }
-]
+
 dependencies = [
     "openenv",
     "pydantic>=2.0,<3.0",
     "fastapi>=0.111,<1.0",
     "uvicorn[standard]>=0.29,<1.0",
     "openai>=1.30,<2.0",
-    "requests>=2.31,<3.0",   # BUG FIX: was missing; inference.py imports requests
+    "requests>=2.31,<3.0",
     "python-dotenv>=1.0,<2.0",
 ]
 
 [project.scripts]
-phishguard-server = "server.app:main"
+server = "server.app:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["server*"]
 
 [project.urls]
-Homepage = "https://huggingface.co/spaces/Scalar-hackathon/Phishing-env"
-Repository = "https://github.com/og-arin/phishguard-env"
+Homepage = "https://huggingface.co/spaces/Scalar-hackathon/Phishguard-env"
+Repository = "https://github.com/Maanya-Jadhav/testing-phishguard"
