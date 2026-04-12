@@ -22,3 +22,19 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from env import app  # re-export — the validator binds to this name
 
 __all__ = ["app"]
+
+
+def main():
+    """Entry point for `[project.scripts]` and direct execution."""
+    import uvicorn
+    uvicorn.run(
+        "server.app:app",
+        host="0.0.0.0",
+        port=7860,
+        reload=False,
+        log_level="info",
+    )
+
+
+if __name__ == "__main__":
+    main()

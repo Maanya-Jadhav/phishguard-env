@@ -22,6 +22,9 @@ dependencies = [
     "python-dotenv>=1.0,<2.0",
 ]
 
+[project.scripts]
+phishguard-server = "server.app:main"
+
 [project.urls]
 Homepage = "https://huggingface.co/spaces/Scalar-hackathon/Phishing-env"
 Repository = "https://github.com/og-arin/phishguard-env"
