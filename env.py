@@ -6,15 +6,18 @@ ARCHITECTURE ROLE
 -----------------
 This file IS the environment. It runs as a persistent FastAPI server on
 Hugging Face Spaces (port 7860). The inference agent (inference.py) is a
-separate process that interacts with it exclusively through HTTP — it NEVER
-imports this module directly.
+separate process that interacts with it exclusively through HTTP.
 
 Endpoints
 ---------
-  POST /reset   → reset for a chosen difficulty level; returns first email observation
-  POST /step    → submit one triage action; returns (obs, reward, done, info)
-  GET  /state   → read-only snapshot of health, score, task index
-  GET  /health  → liveness probe for HF Spaces / load-balancers
+  POST /reset               → reset for a chosen difficulty level
+  POST /step                → submit one triage action
+  GET  /state               → read-only snapshot of health, score, metrics
+  GET  /health              → liveness probe
+  GET  /tasks               → list all task IDs and correct actions
+  POST /grader              → grade a single action without a full episode
+  POST /grade/{difficulty}  → grade a full metrics dict for a difficulty
+  POST /grade/performance   → aggregate cross-level grader
 
 LEVEL DESIGN
 ------------
@@ -22,47 +25,21 @@ LEVEL DESIGN
   medium → lv4, lv5, lv6, lv7   (4 tasks)
   hard   → lv8, lv9, lv10       (3 tasks)
 
-State variables
----------------
-  current_task_idx  : int   – index into the active scenario list
-  health            : int   – lives remaining (starts at 3)
-  score             : float – cumulative reward for this episode
-  task_scores       : list  – per-step reward history
+Metrics tracked per episode (keys required by GRADERS)
+-------------------------------------------------------
+  total_tasks      : number of scenarios in this level
+  completed_tasks  : steps where a graded action was taken
+  perfect_tasks    : steps where reward >= R_PERFECT
+  on_time          : steps where reward >= HEALTH_DRAIN_THRESHOLD
+  breach_count     : steps where reward == R_BREACH
+  disruption_count : steps where reward == R_DISRUPTION
+  total_steps      : total /step calls
 
-Reward contract
----------------
-All rewards are sourced from grader.py and strictly in the open interval
-(0.0, 1.0). No endpoint ever returns 0 or 1.
-
-Health drain
-------------
-HEALTH_DRAIN_THRESHOLD = 0.15 (imported from grader).
-Any step reward below this threshold costs one life.
-  Security Breach (0.02)       → –1 life
-  Business Disruption (0.05)   → –1 life
-  Wrong Procedure (0.10)       → –1 life
-  Cautious / partial (≥ 0.35)  → no life loss
-
-Thread safety
+Episode score
 -------------
-_env is a singleton shared across all FastAPI requests. The asyncio.Lock
-`_env_lock` serialises access to _env so concurrent /step or /reset calls
-cannot race on current_task_idx, health, score, or task_scores.
-
-OpenEnv validator compliance
------------------------------
-Every normal /step response includes:
-  task_id    : str  – the scenario id (e.g. "lv3") so the validator can
-                      correlate decisions to tasks.
-  is_correct : bool – True when reward >= R_PERFECT, so the validator
-                      can count "tasks with graders" (≥ 3 required).
-
-BUG FIXES (v1.0.2 → v1.0.3)
------------------------------
-  • Thread-safety: asyncio.Lock added around all _env mutations.
-  • total_tasks in /reset now correctly reports len(LEVEL_MAP[level])
-    (the count for the chosen level only) instead of len(_env.scenarios)
-    which could include stale data from a previous reset.
+When done=True, info["score"] = GRADERS[active_level](metrics).
+This is the same function the OpenEnv validator checks — guaranteeing
+consistency between what the validator sees and what we report.
 """
 
 from __future__ import annotations
@@ -93,18 +70,21 @@ except ImportError:
     try:
         from openenv.core import OpenEnv  # type: ignore
     except ImportError:
-        OpenEnv = object  # Runs as a plain Python class if openenv is absent
+        OpenEnv = object
 
 # ── Grader imports ────────────────────────────────────────────────────────────
+# NOTE: SCENARIO_LOADERS has been removed — it never existed in grader.py.
+#       Level-to-scenario mapping is owned entirely by LEVEL_MAP in this file.
 from grader import (
     R_BREACH,
+    R_DISRUPTION,
     R_PERFECT,
     HEALTH_DRAIN_THRESHOLD,
+    GRADERS,
+    TASK_GRADERS,
     calculate_overall_score,
     grade_action,
     grade_performance,
-    GRADERS,
-    SCENARIO_LOADERS,
 )
 
 VERSION = "1.0.3"
@@ -116,16 +96,11 @@ VERSION = "1.0.3"
 SCENARIOS: List[dict] = [
     # ── EASY (lv1–lv3) ───────────────────────────────────────────────────────
     {
-        "id": "lv1",
-        "level": "easy",
-        "type": "SPAM",
+        "id": "lv1", "level": "easy", "type": "SPAM",
         "data": {
             "sender": "win@lotto.net",
             "subject": "Claim $1M Prize – Congratulations!",
-            "body": (
-                "You have been selected. "
-                "Click now to claim your prize before it expires."
-            ),
+            "body": "You have been selected. Click now to claim your prize before it expires.",
             "links": ["http://bit.ly/123abc"],
             "has_attachments": False,
             "spf_record": "fail",
@@ -136,16 +111,11 @@ SCENARIOS: List[dict] = [
         "correct": "MOVE_TO_SPAM",
     },
     {
-        "id": "lv2",
-        "level": "easy",
-        "type": "PHISH",
+        "id": "lv2", "level": "easy", "type": "PHISH",
         "data": {
             "sender": "support@googIe.com",
             "subject": "Urgent Security Alert – Verify Your Account",
-            "body": (
-                "We detected suspicious activity on your account. "
-                "Verify your identity immediately."
-            ),
+            "body": "We detected suspicious activity on your account. Verify your identity immediately.",
             "links": ["http://googIe-verify.com/login"],
             "has_attachments": False,
             "spf_record": "softfail",
@@ -156,16 +126,11 @@ SCENARIOS: List[dict] = [
         "correct": "BLOCK_DOMAIN",
     },
     {
-        "id": "lv3",
-        "level": "easy",
-        "type": "SAFE",
+        "id": "lv3", "level": "easy", "type": "SAFE",
         "data": {
             "sender": "boss@company.com",
             "subject": "Team Meeting Tomorrow at 9 AM",
-            "body": (
-                "Hi team, please be ready for our weekly sync at 9 AM "
-                "in the main boardroom."
-            ),
+            "body": "Hi team, please be ready for our weekly sync at 9 AM in the main boardroom.",
             "links": [],
             "has_attachments": False,
             "spf_record": "pass",
@@ -178,16 +143,11 @@ SCENARIOS: List[dict] = [
 
     # ── MEDIUM (lv4–lv7) ─────────────────────────────────────────────────────
     {
-        "id": "lv4",
-        "level": "medium",
-        "type": "MALWARE",
+        "id": "lv4", "level": "medium", "type": "MALWARE",
         "data": {
             "sender": "it@internal-help.com",
             "subject": "Critical Security Patch – Action Required Immediately",
-            "body": (
-                "A critical vulnerability has been discovered. "
-                "Run fix.exe to patch your system now."
-            ),
+            "body": "A critical vulnerability has been discovered. Run fix.exe to patch your system now.",
             "links": ["http://internal-help.com/fix.exe"],
             "has_attachments": True,
             "spf_record": "fail",
@@ -198,39 +158,26 @@ SCENARIOS: List[dict] = [
         "correct": "QUARANTINE",
     },
     {
-        "id": "lv5",
-        "level": "medium",
-        "type": "SAFE",
+        "id": "lv5", "level": "medium", "type": "SAFE",
         "data": {
             "sender": "hr@yourcompany.com",
             "subject": "Updated Holiday Schedule – Please Review",
-            "body": (
-                "Hi all, the updated holiday list is now live on the HR portal. "
-                "No action needed."
-            ),
+            "body": "Hi all, the updated holiday list is now live on the HR portal. No action needed.",
             "links": ["https://portal.yourcompany.com/holidays"],
             "has_attachments": False,
             "spf_record": "pass",
             "dmarc_record": "pass",
             "urgency_level": "low",
-            "confidence_hint": (
-                "SIEM: bulk-sent to all-staff distribution list, "
-                "normal recurring pattern"
-            ),
+            "confidence_hint": "SIEM: bulk-sent to all-staff distribution list, normal recurring pattern",
         },
         "correct": "MARK_SAFE",
     },
     {
-        "id": "lv6",
-        "level": "medium",
-        "type": "BEC",
+        "id": "lv6", "level": "medium", "type": "BEC",
         "data": {
             "sender": "ceo@executive-mail.com",
             "subject": "URGENT – Wire Transfer Required Today",
-            "body": (
-                "I'm in a meeting and cannot be reached by phone. "
-                "Wire $5,000 to the account below immediately."
-            ),
+            "body": "I'm in a meeting and cannot be reached by phone. Wire $5,000 to the account below immediately.",
             "links": [],
             "has_attachments": False,
             "spf_record": "pass",
@@ -241,64 +188,43 @@ SCENARIOS: List[dict] = [
         "correct": "QUARANTINE",
     },
     {
-        "id": "lv7",
-        "level": "medium",
-        "type": "PHISH",
+        "id": "lv7", "level": "medium", "type": "PHISH",
         "data": {
             "sender": "notify@docs-share.net",
             "subject": "You Have a New Shared Document",
-            "body": (
-                "Your colleague shared a file with you. "
-                "Click the link below to view it in your browser."
-            ),
+            "body": "Your colleague shared a file with you. Click the link below to view it in your browser.",
             "links": ["https://docs-verify.net/s/1x9az"],
             "has_attachments": False,
             "spf_record": "softfail",
             "dmarc_record": "fail",
             "urgency_level": "medium",
-            "confidence_hint": (
-                "Gateway: destination link redirects through 2 URL shorteners "
-                "before landing"
-            ),
+            "confidence_hint": "Gateway: destination link redirects through 2 URL shorteners before landing",
         },
         "correct": "BLOCK_DOMAIN",
     },
 
     # ── HARD (lv8–lv10) ──────────────────────────────────────────────────────
     {
-        "id": "lv8",
-        "level": "hard",
-        "type": "MALWARE",
+        "id": "lv8", "level": "hard", "type": "MALWARE",
         "data": {
             "sender": "payroll@hr-dept.net",
             "subject": "Your Bank Details Form – Action Required",
-            "body": (
-                "Please review and complete the attached payroll update form "
-                "before Friday."
-            ),
+            "body": "Please review and complete the attached payroll update form before Friday.",
             "links": [],
             "has_attachments": True,
             "spf_record": "fail",
             "dmarc_record": "fail",
             "urgency_level": "high",
-            "confidence_hint": (
-                "AV: attachment is a macro-enabled Excel file (.xlsm), "
-                "macros unsigned"
-            ),
+            "confidence_hint": "AV: attachment is a macro-enabled Excel file (.xlsm), macros unsigned",
         },
         "correct": "QUARANTINE",
     },
     {
-        "id": "lv9",
-        "level": "hard",
-        "type": "PHISH",
+        "id": "lv9", "level": "hard", "type": "PHISH",
         "data": {
             "sender": "mfa@office365-auth.com",
             "subject": "Action Required: Update Your MFA Settings Now",
-            "body": (
-                "Your multi-factor authentication settings must be updated. "
-                "Scan the QR code in the attached image to stay compliant."
-            ),
+            "body": "Your multi-factor authentication settings must be updated. Scan the QR code in the attached image to stay compliant.",
             "links": [],
             "has_attachments": True,
             "spf_record": "softfail",
@@ -309,31 +235,22 @@ SCENARIOS: List[dict] = [
         "correct": "QUARANTINE",
     },
     {
-        "id": "lv10",
-        "level": "hard",
-        "type": "BEC",
+        "id": "lv10", "level": "hard", "type": "BEC",
         "data": {
             "sender": "partner@trusted-firm.com",
             "subject": "Updated Project Specifications – Download Required by EOD",
-            "body": (
-                "Please find the revised project specs at the link below. "
-                "Deadline is tomorrow morning."
-            ),
+            "body": "Please find the revised project specs at the link below. Deadline is tomorrow morning.",
             "links": ["https://trusted-partner.com/files/project_specs_final.zip"],
             "has_attachments": False,
             "spf_record": "pass",
             "dmarc_record": "pass",
             "urgency_level": "high",
-            "confidence_hint": (
-                "Threat Intel: trusted-firm.com added to IOC feed 6 hours ago "
-                "— possible domain compromise"
-            ),
+            "confidence_hint": "Threat Intel: trusted-firm.com added to IOC feed 6 hours ago — possible domain compromise",
         },
         "correct": "BLOCK_DOMAIN",
     },
 ]
 
-# ── Level → scenario IDs mapping ─────────────────────────────────────────────
 LEVEL_MAP: dict[str, list[str]] = {
     "easy":   ["lv1", "lv2", "lv3"],
     "medium": ["lv4", "lv5", "lv6", "lv7"],
@@ -344,23 +261,27 @@ _SCENARIO_BY_ID: dict[str, dict] = {s["id"]: s for s in SCENARIOS}
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# HELPERS
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _empty_metrics(total_tasks: int = 0) -> dict:
+    """Zeroed metrics dict with all keys expected by GRADERS."""
+    return {
+        "total_tasks":      total_tasks,
+        "completed_tasks":  0,
+        "perfect_tasks":    0,
+        "on_time":          0,
+        "breach_count":     0,
+        "disruption_count": 0,
+        "total_steps":      0,
+    }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # ENVIRONMENT CLASS
 # ═════════════════════════════════════════════════════════════════════════════
 
 class PhishGuardEnv(OpenEnv):
-    """
-    OpenEnv-compliant simulation environment for SOC analyst LLM benchmarking.
-
-    State
-    -----
-    current_task_idx : int   – pointer into the active (shuffled) scenario list
-    health           : int   – lives remaining (3 → 0)
-    score            : float – cumulative reward for this episode
-    task_scores      : list  – per-step reward history
-    active_level     : str   – current difficulty level
-    scenarios        : list  – scenarios loaded for the current level
-    """
-
     MAX_HEALTH: int = 3
 
     def __init__(self) -> None:
@@ -369,94 +290,66 @@ class PhishGuardEnv(OpenEnv):
         self.health: int = self.MAX_HEALTH
         self.score: float = 0.0
         self.task_scores: List[float] = []
+        self.metrics: dict = _empty_metrics()
         self.active_level: str = "easy"
-        # Initialise with easy level so the env is never empty on startup.
         self._load_level("easy")
 
-    # ── Internal helpers ──────────────────────────────────────────────────────
-
     def _load_level(self, level: str) -> None:
-        """
-        Filter and shuffle scenarios for the given difficulty level.
-        Resets all state counters.
-
-        Uses SCENARIO_LOADERS from grader.py (mirrors Focus-AI's
-        TASK_LOADERS pattern) so scenario-to-level mapping is
-        centralised in the grader module.
-        """
         level = level.lower()
         if level not in LEVEL_MAP:
-            raise ValueError(
-                f"Unknown level '{level}'. Valid choices: easy | medium | hard"
-            )
-        # Use SCENARIO_LOADERS if available, fall back to LEVEL_MAP
-        if level in SCENARIO_LOADERS:
-            ids = SCENARIO_LOADERS[level]()
-        else:
-            ids = LEVEL_MAP[level]
+            raise ValueError(f"Unknown level '{level}'. Valid choices: easy | medium | hard")
+        ids    = LEVEL_MAP[level]
         subset = [dict(_SCENARIO_BY_ID[sid]) for sid in ids]
         random.shuffle(subset)
 
-        self.active_level    = level
-        self.scenarios       = subset
+        self.active_level     = level
+        self.scenarios        = subset
         self.current_task_idx = 0
-        self.health          = self.MAX_HEALTH
-        self.score           = 0.0
-        self.task_scores     = []
+        self.health           = self.MAX_HEALTH
+        self.score            = 0.0
+        self.task_scores      = []
+        self.metrics          = _empty_metrics(total_tasks=len(subset))
 
     def _is_over(self) -> bool:
         return self.health <= 0 or self.current_task_idx >= len(self.scenarios)
 
-    # ── Public API ────────────────────────────────────────────────────────────
-
     def reset(self, level: str = "easy") -> dict:
-        """
-        Reset the environment for a new episode at the given difficulty level.
-
-        Returns the first email observation dict.
-
-        Raises
-        ------
-        ValueError
-            If the level is unknown or maps to zero scenarios.
-        """
         self._load_level(level)
         if not self.scenarios:
             raise ValueError(f"No scenarios found for level '{level}'")
         first_task = self.scenarios[self.current_task_idx]
         log.info(
-            "Episode reset | level=%s | first_scenario=%s | total=%d",
-            self.active_level,
-            first_task["id"],
-            len(self.scenarios),
+            "Episode reset | level=%s | first=%s | total=%d",
+            self.active_level, first_task["id"], len(self.scenarios),
         )
         return first_task["data"]
 
     def step(self, action_str: str) -> tuple:
         """
-        Advance the simulation by one triage decision.
+        Advance by one triage decision.
 
-        Returns
-        -------
-        (obs, reward, done, info)
+        Returns (obs, reward, done, info).
+        info["score"] is set (non-None) only when done=True, using
+        GRADERS[active_level](metrics) — the grader the validator checks.
         """
-        # ── Guard: episode already over ───────────────────────────────────────
+        # ── Guard ─────────────────────────────────────────────────────────────
         if self._is_over():
+            self.metrics["total_steps"] += 1
             return None, R_BREACH, True, {
                 "task_id":     None,
                 "task_group":  None,
                 "is_correct":  False,
                 "health":      self.health,
                 "feedback":    "Episode already ended. Call /reset to start a new one.",
-                "score":       round(self.score, 4),
+                "score":       None,
+                "metrics":     dict(self.metrics),
                 "task_scores": list(self.task_scores),
             }
 
-        # ── Resolve current scenario ──────────────────────────────────────────
         current_task = self.scenarios[self.current_task_idx]
         task_id      = current_task["id"]
 
-        # ── Grade the action ──────────────────────────────────────────────────
+        # ── Grade ─────────────────────────────────────────────────────────────
         reward, verdict_msg = grade_action(
             action_str,
             current_task["correct"],
@@ -466,13 +359,26 @@ class PhishGuardEnv(OpenEnv):
         self.score += reward
         self.task_scores.append(reward)
 
+        # ── Update metrics ────────────────────────────────────────────────────
+        self.metrics["total_steps"]     += 1
+        self.metrics["completed_tasks"] += 1
+
+        if reward >= R_PERFECT:
+            self.metrics["perfect_tasks"] += 1
+
+        if reward >= HEALTH_DRAIN_THRESHOLD:
+            self.metrics["on_time"] += 1
+
+        if reward == R_BREACH:
+            self.metrics["breach_count"] += 1
+
+        if reward == R_DISRUPTION:
+            self.metrics["disruption_count"] += 1
+
         log.info(
-            "Step | level=%s | task=%s | action=%s | reward=%.4f | verdict=%s",
-            self.active_level,
-            task_id,
-            action_str.strip().upper(),
-            reward,
-            verdict_msg,
+            "Step | level=%s | task=%s | action=%s | reward=%.4f | %s",
+            self.active_level, task_id,
+            action_str.strip().upper(), reward, verdict_msg,
         )
 
         # ── Health drain ──────────────────────────────────────────────────────
@@ -485,7 +391,7 @@ class PhishGuardEnv(OpenEnv):
         else:
             feedback = f"✅ Analysis accepted: {verdict_msg}"
 
-        # ── Advance task pointer ──────────────────────────────────────────────
+        # ── Advance pointer ───────────────────────────────────────────────────
         done = False
         self.current_task_idx += 1
 
@@ -501,12 +407,20 @@ class PhishGuardEnv(OpenEnv):
                     f"{self.active_level.upper()} scenarios completed."
                 )
 
-        # ── Next observation ──────────────────────────────────────────────────
         obs = (
             self.scenarios[self.current_task_idx]["data"]
             if not self._is_over()
             else None
         )
+
+        # ── Episode score via GRADERS ─────────────────────────────────────────
+        episode_score: Optional[float] = None
+        if done:
+            episode_score = GRADERS[self.active_level](self.metrics)
+            log.info(
+                "Episode done | level=%s | score=%.6f | metrics=%s",
+                self.active_level, episode_score, self.metrics,
+            )
 
         return obs, reward, done, {
             "task_id":     task_id,
@@ -514,7 +428,8 @@ class PhishGuardEnv(OpenEnv):
             "is_correct":  reward >= R_PERFECT,
             "health":      self.health,
             "feedback":    feedback,
-            "score":       round(self.score, 4),
+            "score":       episode_score,
+            "metrics":     dict(self.metrics),
             "task_scores": list(self.task_scores),
         }
 
@@ -523,10 +438,7 @@ class PhishGuardEnv(OpenEnv):
 # FASTAPI APPLICATION
 # ═════════════════════════════════════════════════════════════════════════════
 
-# Singleton environment instance — shared across all requests.
 _env      = PhishGuardEnv()
-# BUG FIX: asyncio.Lock serialises /reset and /step so concurrent requests
-# cannot race on _env's mutable state (current_task_idx, health, score, etc.).
 _env_lock = asyncio.Lock()
 
 
@@ -555,56 +467,38 @@ app.add_middleware(
 )
 
 
-# ── Liveness probe ────────────────────────────────────────────────────────────
 @app.get("/health", tags=["Meta"])
 async def health_probe() -> dict:
-    """Liveness probe — HF Spaces and load-balancers call this endpoint."""
     return {"status": "ok", "env": "PhishGuard-Env", "version": VERSION}
 
 
-# ── Reset ─────────────────────────────────────────────────────────────────────
 @app.post("/reset", tags=["Environment"])
 async def reset(request: Optional[ResetRequest] = None) -> ResetResponse:
-    """
-    Reset the environment for a new episode at the chosen difficulty level.
-
-    Body (optional): { "level": "easy" | "medium" | "hard" }
-    If no body is provided, defaults to "easy".
-    """
+    """Reset for a new episode. Body (optional): { "level": "easy"|"medium"|"hard" }"""
     level = (request.level if request else "easy").lower()
     if level not in LEVEL_MAP:
         raise HTTPException(
             status_code=422,
             detail=f"Invalid level '{level}'. Must be one of: easy | medium | hard",
         )
-
     async with _env_lock:
         obs = _env.reset(level=level)
         first_scenario = _env.scenarios[_env.current_task_idx]
-        active_level = _env.active_level
+        active_level   = _env.active_level
 
     return ResetResponse(
         observation=obs,
         task_id=first_scenario["id"],
         task_group=first_scenario["level"],
         level=active_level,
-        # BUG FIX: was len(_env.scenarios) which could be stale;
-        # now reads directly from LEVEL_MAP for the requested level.
         total_tasks=len(LEVEL_MAP[level]),
     )
 
 
-# ── Step ──────────────────────────────────────────────────────────────────────
 @app.post("/step", tags=["Environment"])
 async def step(action: PhishAction) -> StepResponse:
-    """
-    Submit one triage action and receive the next observation + reward.
-
-    Body: { "action": "MARK_SAFE | MOVE_TO_SPAM | QUARANTINE | BLOCK_DOMAIN",
-            "reasoning": "optional" }
-    """
+    """Submit one triage action."""
     action_str = action.action.strip().upper()[:64]
-
     async with _env_lock:
         obs, reward, done, info = _env.step(action_str)
 
@@ -618,61 +512,51 @@ async def step(action: PhishAction) -> StepResponse:
     )
 
 
-# ── State ─────────────────────────────────────────────────────────────────────
 @app.get("/state", tags=["Environment"])
 async def state() -> dict:
-    """Read-only snapshot of the current environment state."""
+    """Read-only snapshot. Does not advance the simulation."""
     async with _env_lock:
-        overall = calculate_overall_score(_env.task_scores)
+        episode_score  = GRADERS[_env.active_level](_env.metrics)
+        rolling_score  = calculate_overall_score(_env.task_scores)
         return {
             "level":         _env.active_level,
             "health":        _env.health,
             "score":         round(_env.score, 4),
-            "overall_score": overall,
+            "overall_score": episode_score,   # GRADERS-based — what validator checks
+            "rolling_score": rolling_score,   # calculate_overall_score per-step avg
             "task_index":    _env.current_task_idx,
             "total_tasks":   len(_env.scenarios),
             "task_scores":   list(_env.task_scores),
+            "metrics":       dict(_env.metrics),
         }
 
 
-# ── Tasks ─────────────────────────────────────────────────────────────────────
 @app.get("/tasks", tags=["Environment"])
 async def tasks() -> dict:
-    """List all tasks with their IDs, difficulty, and correct actions."""
     return {
         "tasks": [
-            {
-                "task_id":    s["id"],
-                "difficulty": s["level"],
-                "type":       s["type"],
-                "correct":    s["correct"],
-            }
+            {"task_id": s["id"], "difficulty": s["level"],
+             "type": s["type"], "correct": s["correct"]}
             for s in SCENARIOS
         ]
     }
 
 
-# ── Grader ────────────────────────────────────────────────────────────────────
-@app.post("/grader", tags=["Environment"])
-async def grader(request: dict) -> dict:
+@app.post("/grader", tags=["Grading"])
+async def grader_endpoint(request: dict) -> dict:
     """
-    Grade a triage action for a specific task without running a full episode.
-    The OpenEnv validator calls this endpoint to verify graders are working.
-
+    Grade a single action for a task without a full episode.
     Body: { "task_id": "lv1", "action": "MOVE_TO_SPAM" }
     """
     task_id = request.get("task_id", "lv1")
     action  = request.get("action",  "QUARANTINE")
-
     scenario = next((s for s in SCENARIOS if s["id"] == task_id), None)
     if scenario is None:
         raise HTTPException(
             status_code=404,
             detail=f"Task '{task_id}' not found. Valid IDs: {[s['id'] for s in SCENARIOS]}",
         )
-
     reward, message = grade_action(action, scenario["correct"], scenario["type"])
-
     return {
         "task_id":    task_id,
         "action":     action,
@@ -682,20 +566,11 @@ async def grader(request: dict) -> dict:
     }
 
 
-# ── Grade by Difficulty ───────────────────────────────────────────────────────
-# Mirrors Focus-AI's GRADERS dict pattern — allows grading an entire
-# difficulty level by passing metrics, just like Focus-AI's env.py uses
-# GRADERS[difficulty](metrics) at episode end.
 @app.post("/grade/{difficulty}", tags=["Grading"])
 async def grade_difficulty(difficulty: str, metrics: dict) -> dict:
     """
-    Grade a full episode for a specific difficulty level using the
-    deterministic grader function.
-
-    This mirrors Focus-AI's GRADERS[difficulty](metrics) pattern.
-
-    Path param: difficulty = easy | medium | hard
-    Body: metrics dict (e.g. {"total_tasks": 3, "correct_actions": 2, ...})
+    Grade a full episode metrics dict for a difficulty level.
+    Mirrors FocusAI's GRADERS[difficulty](metrics) pattern.
     """
     difficulty = difficulty.lower()
     if difficulty not in GRADERS:
@@ -703,37 +578,15 @@ async def grade_difficulty(difficulty: str, metrics: dict) -> dict:
             status_code=422,
             detail=f"Invalid difficulty '{difficulty}'. Must be one of: {list(GRADERS.keys())}",
         )
-
-    score = GRADERS[difficulty](metrics)
-    return {
-        "difficulty": difficulty,
-        "score":      score,
-        "metrics":    metrics,
-    }
+    return {"difficulty": difficulty, "score": GRADERS[difficulty](metrics), "metrics": metrics}
 
 
-# ── Aggregate Performance Grade ──────────────────────────────────────────────
 @app.post("/grade/performance", tags=["Grading"])
 async def grade_perf(metrics: dict) -> dict:
-    """
-    Cross-difficulty aggregate grader for leaderboard ranking.
-    Mirrors Focus-AI's grade_performance() function.
-    """
-    score = grade_performance(metrics)
-    return {
-        "difficulty": "aggregate",
-        "score":      score,
-        "metrics":    metrics,
-    }
+    """Cross-difficulty aggregate grader. Mirrors FocusAI's grade_performance()."""
+    return {"difficulty": "aggregate", "score": grade_performance(metrics), "metrics": metrics}
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        "server.app:app",
-        host="0.0.0.0",
-        port=7860,
-        reload=False,
-        log_level="info",
-    )
+    uvicorn.run("server.app:app", host="0.0.0.0", port=7860, reload=False, log_level="info")
