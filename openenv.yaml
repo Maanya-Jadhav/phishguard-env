@@ -1,5 +1,6 @@
 # PhishGuard-Env – OpenEnv Manifest
 # Each task must declare a grader so the validator can verify scoring.
+# Pattern mirrors Focus-AI's openenv.yaml with per-difficulty graders + aggregate.
 id: phishguard-env
 name: "PhishGuard-Env — SOC Analyst Phishing Triage"
 description: >
@@ -35,6 +36,14 @@ tasks:
       Covers macro malware, QR-code phishing, BEC domain compromise.
       Scoring: 35% correct action + 30% threat accuracy + 20% escalation + 15% priority.
 
+  - id: performance
+    name: aggregate_performance
+    grader: "grader:grade_performance"
+    description: >
+      Cross-difficulty aggregate grader for leaderboard ranking.
+      Provides a single unified score across all difficulty levels.
+      Scoring: 40% correct actions + 30% on-time + 20% escalation + 10% priority.
+
 observation_space:
   type: object
   fields:
@@ -62,6 +71,14 @@ reward:
   description: >
     All rewards strictly inside open interval (0, 1).
     R_PERFECT=0.95, R_BREACH=0.02. Health drains on reward < 0.15.
+
+scoring:
+  description: >
+    Each task's final score is STRICTLY inside the open interval (0, 1).
+    The _safe_score() function guarantees: 0.02 ≤ score ≤ 0.95.
+    Minimum achievable: 0.02 (breach / nothing done).
+    Maximum achievable: 0.95 (perfect episode).
+  formula: "_safe_score(raw) = 0.02 + 0.93 * clamp(raw, 0.0, 1.0)"
 
 tags:
   - cybersecurity

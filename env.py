@@ -102,6 +102,9 @@ from grader import (
     HEALTH_DRAIN_THRESHOLD,
     calculate_overall_score,
     grade_action,
+    grade_performance,
+    GRADERS,
+    SCENARIO_LOADERS,
 )
 
 VERSION = "1.0.3"
@@ -376,13 +379,21 @@ class PhishGuardEnv(OpenEnv):
         """
         Filter and shuffle scenarios for the given difficulty level.
         Resets all state counters.
+
+        Uses SCENARIO_LOADERS from grader.py (mirrors Focus-AI's
+        TASK_LOADERS pattern) so scenario-to-level mapping is
+        centralised in the grader module.
         """
         level = level.lower()
         if level not in LEVEL_MAP:
             raise ValueError(
                 f"Unknown level '{level}'. Valid choices: easy | medium | hard"
             )
-        ids    = LEVEL_MAP[level]
+        # Use SCENARIO_LOADERS if available, fall back to LEVEL_MAP
+        if level in SCENARIO_LOADERS:
+            ids = SCENARIO_LOADERS[level]()
+        else:
+            ids = LEVEL_MAP[level]
         subset = [dict(_SCENARIO_BY_ID[sid]) for sid in ids]
         random.shuffle(subset)
 
@@ -608,6 +619,22 @@ async def step(action: PhishAction) -> StepResponse:
 
 
 # ── State ─────────────────────────────────────────────────────────────────────
+@app.get("/state", tags=["Environment"])
+async def state() -> dict:
+    """Read-only snapshot of the current environment state."""
+    async with _env_lock:
+        overall = calculate_overall_score(_env.task_scores)
+        return {
+            "level":         _env.active_level,
+            "health":        _env.health,
+            "score":         round(_env.score, 4),
+            "overall_score": overall,
+            "task_index":    _env.current_task_idx,
+            "total_tasks":   len(_env.scenarios),
+            "task_scores":   list(_env.task_scores),
+        }
+
+
 # ── Tasks ─────────────────────────────────────────────────────────────────────
 @app.get("/tasks", tags=["Environment"])
 async def tasks() -> dict:
@@ -652,6 +679,51 @@ async def grader(request: dict) -> dict:
         "reward":     reward,
         "is_correct": reward >= R_PERFECT,
         "message":    message,
+    }
+
+
+# ── Grade by Difficulty ───────────────────────────────────────────────────────
+# Mirrors Focus-AI's GRADERS dict pattern — allows grading an entire
+# difficulty level by passing metrics, just like Focus-AI's env.py uses
+# GRADERS[difficulty](metrics) at episode end.
+@app.post("/grade/{difficulty}", tags=["Grading"])
+async def grade_difficulty(difficulty: str, metrics: dict) -> dict:
+    """
+    Grade a full episode for a specific difficulty level using the
+    deterministic grader function.
+
+    This mirrors Focus-AI's GRADERS[difficulty](metrics) pattern.
+
+    Path param: difficulty = easy | medium | hard
+    Body: metrics dict (e.g. {"total_tasks": 3, "correct_actions": 2, ...})
+    """
+    difficulty = difficulty.lower()
+    if difficulty not in GRADERS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid difficulty '{difficulty}'. Must be one of: {list(GRADERS.keys())}",
+        )
+
+    score = GRADERS[difficulty](metrics)
+    return {
+        "difficulty": difficulty,
+        "score":      score,
+        "metrics":    metrics,
+    }
+
+
+# ── Aggregate Performance Grade ──────────────────────────────────────────────
+@app.post("/grade/performance", tags=["Grading"])
+async def grade_perf(metrics: dict) -> dict:
+    """
+    Cross-difficulty aggregate grader for leaderboard ranking.
+    Mirrors Focus-AI's grade_performance() function.
+    """
+    score = grade_performance(metrics)
+    return {
+        "difficulty": "aggregate",
+        "score":      score,
+        "metrics":    metrics,
     }
 
 

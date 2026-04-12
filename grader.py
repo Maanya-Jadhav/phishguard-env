@@ -55,7 +55,10 @@ BUG FIX (v1.0.2 → v1.0.3)
 
 from __future__ import annotations
 
+import logging
 from typing import Tuple
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "R_PERFECT",
@@ -73,7 +76,10 @@ __all__ = [
     "grade_easy",
     "grade_medium",
     "grade_hard",
+    "grade_performance",
     "calculate_overall_score",
+    "GRADERS",
+    "SCENARIO_LOADERS",
 ]
 
 
@@ -221,11 +227,29 @@ def calculate_overall_score(task_scores: list) -> float:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _safe_score(raw: float) -> float:
-    """Map any float to the open interval (R_BREACH, R_PERFECT)."""
+    """
+    Map any float to the open interval (R_BREACH, R_PERFECT).
+
+    Mirrors Focus-AI's safe_score() pattern:
+        safe_score(raw) = LOWER + (UPPER - LOWER) * clamp(raw, 0, 1)
+    where LOWER = R_BREACH (0.02), UPPER = R_PERFECT (0.95).
+
+    Guarantees:
+        raw = 0.0  ->  0.02   (> 0, never equals 0)
+        raw = 1.0  ->  0.95   (< 1, never equals 1)
+    """
     raw = float(raw)
-    raw = max(0.0, min(1.0, raw))
+    if raw < 0.0:
+        raw = 0.0
+    elif raw > 1.0:
+        raw = 1.0
     result = R_BREACH + (R_PERFECT - R_BREACH) * raw
-    return round(result, 6)
+    result = round(result, 6)
+    assert 0.0 < result < 1.0, (
+        f"_safe_score VIOLATION: raw={raw!r} produced result={result!r} "
+        f"which is not strictly inside (0, 1)"
+    )
+    return result
 
 
 def _safe_ratio(num: float, den: float) -> float:
@@ -309,3 +333,71 @@ def grade_hard(metrics: dict) -> float:
         + 0.15 * _safe_ratio(hi_pri,   max(1, correct))
     )
     return _safe_score(raw)
+
+
+def grade_performance(metrics: dict) -> float:
+    """
+    Aggregate grader used for cross-difficulty scoring.
+
+    Mirrors Focus-AI's grade_performance() pattern — provides a single
+    unified score across all difficulty levels for leaderboard ranking.
+
+    Scoring: 40% correct actions + 30% on-time + 20% escalation + 10% priority.
+    """
+    total    = max(1, metrics.get("total_tasks", metrics.get("total", 1)))
+    correct  = metrics.get("correct_actions", metrics.get("is_correct", 0))
+    on_time  = metrics.get("on_time", metrics.get("completed", correct))
+    steps    = max(1, metrics.get("total_steps", metrics.get("steps", 1)))
+    good_esc = metrics.get("good_escalation", metrics.get("reward", correct))
+
+    if isinstance(correct,  bool): correct  = int(correct)
+    if isinstance(on_time,  bool): on_time  = int(on_time)
+    if isinstance(good_esc, bool): good_esc = int(good_esc)
+
+    raw = (
+        0.40 * _safe_ratio(correct,  total)
+        + 0.30 * _safe_ratio(on_time,  total)
+        + 0.20 * _safe_ratio(good_esc, steps)
+        + 0.10 * _safe_ratio(correct,  steps)
+    )
+    return _safe_score(raw)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GRADERS DICT  (mirrors Focus-AI's GRADERS pattern)
+# Maps difficulty level → grader function for easy programmatic lookup.
+# ══════════════════════════════════════════════════════════════════════════════
+
+GRADERS = {
+    "easy":   grade_easy,
+    "medium": grade_medium,
+    "hard":   grade_hard,
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SCENARIO LOADERS  (mirrors Focus-AI's TASK_LOADERS pattern)
+# Maps difficulty level → callable that returns the scenario list for that level.
+# Used by env.py to load scenarios without hard-coding level names.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _get_easy_scenarios() -> list:
+    """Return scenario IDs for easy difficulty."""
+    return ["lv1", "lv2", "lv3"]
+
+
+def _get_medium_scenarios() -> list:
+    """Return scenario IDs for medium difficulty."""
+    return ["lv4", "lv5", "lv6", "lv7"]
+
+
+def _get_hard_scenarios() -> list:
+    """Return scenario IDs for hard difficulty."""
+    return ["lv8", "lv9", "lv10"]
+
+
+SCENARIO_LOADERS = {
+    "easy":   _get_easy_scenarios,
+    "medium": _get_medium_scenarios,
+    "hard":   _get_hard_scenarios,
+}

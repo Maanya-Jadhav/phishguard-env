@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional
 import requests
 from openai import OpenAI
 
-from grader import PASS_THRESHOLD
+from grader import PASS_THRESHOLD, GRADERS, grade_performance
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration
