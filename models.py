@@ -49,7 +49,7 @@ class PhishAction(BaseModel):
 
 class ResetRequest(BaseModel):
     """Body schema for POST /reset."""
-    level: str = Field(
+    difficulty: str = Field(
         default="easy",
         description="Difficulty level: easy | medium | hard",
     )
@@ -102,7 +102,7 @@ class ResetResponse(BaseModel):
     task_group: str = Field(
         description="Difficulty level of the first scenario: easy | medium | hard"
     )
-    level: str = Field(
+    difficulty: str = Field(
         description="Active difficulty level for this episode"
     )
     total_tasks: int = Field(
